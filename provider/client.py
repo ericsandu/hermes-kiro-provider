@@ -523,7 +523,8 @@ class KiroClient:
 
         buffer = EventStreamBuffer()
         try:
-            while raw := response.read(8192):
+            read = getattr(response, "read1", None) or response.read
+            while raw := read(8192):
                 buffer.add_data(raw)
                 while True:
                     try:
@@ -583,6 +584,8 @@ class KiroClient:
             if event == "assistantResponseEvent" and isinstance(data.get("content"), str) and data["content"]:
                 yield _chunk(model, {"role": "assistant" if not sent else None, "content": data["content"]})
                 sent = True
+            elif event == "reasoningContentEvent" and isinstance(data.get("text"), str) and data["text"]:
+                yield _chunk(model, {"reasoning_content": data["text"]})
             elif event == "toolUseEvent":
                 self._add_tool_event(calls, data)
             elif event == "metadataEvent" and data.get("stopReason") == "TOOL_USE":
