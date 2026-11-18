@@ -311,6 +311,74 @@ def _chunk(model: str, delta: dict, finish: str | None = None) -> SimpleNamespac
     return SimpleNamespace(id=f"chatcmpl-{uuid.uuid4().hex}", object="chat.completion.chunk", created=int(time.time()), model=model, choices=[SimpleNamespace(index=0, delta=SimpleNamespace(**delta), finish_reason=finish)])
 
 
+# Max input window per model; source: Kiro model catalog tokenLimits.maxInputTokens.
+_CONTEXT_WINDOWS = {
+    "auto": 1_000_000,
+    "claude-opus-5.5": 1_000_000,
+    "claude-sonnet-5.5": 1_000_000,
+    "claude-haiku-5.5": 1_000_000,
+    "gpt-5.6-sol": 986_000,
+    "gpt-5.6-terra": 986_000,
+    "gpt-5.6-luna": 986_000,
+    "grok-4.7": 500_000,
+    "kimi-k3": 1_000_000,
+    "claude-opus-5": 1_000_000,
+    "claude-sonnet-5": 1_000_000,
+    "claude-opus-4.8": 1_000_000,
+    "claude-opus-4.7": 1_000_000,
+    "claude-opus-4.6": 1_000_000,
+    "claude-sonnet-4.6": 1_000_000,
+    "claude-opus-4.5": 200_000,
+    "claude-sonnet-4.5": 200_000,
+    "claude-haiku-4.5": 200_000,
+    "deepseek-3.2": 164_000,
+    "minimax-m2.5": 196_000,
+    "minimax-m2.1": 196_000,
+    "glm-5": 200_000,
+    "qwen3-coder-next": 256_000,
+}
+CHARS_PER_TOKEN = 3
+
+
+def _context_window(model: str) -> int | None:
+    return _CONTEXT_WINDOWS.get(model)
+
+
+def _kiro_usage(model: str, percentage: float | None, output_chars: int) -> SimpleNamespace | None:
+    """Token usage derived from Kiro's ``contextUsagePercentage``, or None when it cannot be derived.
+
+    Kiro reports no token counts. ``total_tokens`` is the percentage of the model's input window,
+    i.e. the context size after the call (output included). The prompt/completion split is an
+    estimate: completion is ``output_chars`` at ``CHARS_PER_TOKEN`` characters per token.
+    """
+    window = _context_window(model)
+    if window is None or isinstance(percentage, bool) or not isinstance(percentage, (int, float)) or not 0 <= percentage < float("inf"):
+        return None
+    total = round(min(percentage, 100.0) / 100 * window)
+    completion = min(total, -(-output_chars // CHARS_PER_TOKEN))
+    return SimpleNamespace(
+        prompt_tokens=total - completion,
+        completion_tokens=completion,
+        total_tokens=total,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+    )
+
+
+def _with_usage(chunk: SimpleNamespace, usage: SimpleNamespace | None) -> SimpleNamespace:
+    if usage is not None:
+        chunk.usage = usage
+    return chunk
+
+
+def _count_output(events: Iterator[tuple[str, dict]], counted: list[int]) -> Iterator[tuple[str, dict]]:
+    """Pass events through, adding the characters of streamed text and reasoning to ``counted[0]``."""
+    for event, data in events:
+        text = data.get("content") if event == "assistantResponseEvent" else data.get("text") if event == "reasoningContentEvent" else None
+        if isinstance(text, str):
+            counted[0] += len(text)
+        yield event, data
+
+
 def _next_or_end(iterator):
     try:
         return next(iterator)
@@ -540,41 +608,46 @@ class KiroClient:
         sent = False
         calls: dict[str, dict[str, str]] = {}
         tools_sent = False
-        for event, data in self._events(body):
+        percentage = None
+        streamed = [0]
+        tool_stop = False
+        for event, data in _count_output(self._events(body), streamed):
             if event == "assistantResponseEvent" and isinstance(data.get("content"), str) and data["content"]:
                 yield _chunk(model, {"role": "assistant" if not sent else None, "content": data["content"]})
                 sent = True
             elif event == "toolUseEvent":
                 self._add_tool_event(calls, data)
             elif event == "metadataEvent" and data.get("stopReason") == "TOOL_USE":
-                if calls:
-                    yield _chunk(model, {"role": "assistant" if not sent else None, "tool_calls": self._tool_calls(calls)})
-                    tools_sent = sent = True
-                yield _chunk(model, {}, "tool_calls")
-                return
+                tool_stop = True
             elif event == "metadataEvent" and str(data.get("stopReason") or "").upper() == "CONTENT_FILTERED":
                 raise KiroAuthError("Kiro declined the request (CONTENT_FILTERED)")
             elif event in {"error", "exception"} or data.get("error"):
                 raise KiroAuthError(f"Kiro stream error: {data.get('message') or data.get('error')}")
-        if calls:
-            yield _chunk(model, {"role": "assistant" if not sent else None, "tool_calls": self._tool_calls(calls)})
-            tools_sent = sent = True
-            yield _chunk(model, {}, "tool_calls")
+            elif event == "contextUsageEvent" and isinstance(data.get("contextUsagePercentage"), (int, float)):
+                percentage = data["contextUsagePercentage"]
+        usage = _kiro_usage(model, percentage, streamed[0] + sum(len(call["name"]) + len(call["arguments"]) for call in calls.values()))
+        if calls or tool_stop:
+            if calls:
+                yield _chunk(model, {"role": "assistant" if not sent else None, "tool_calls": self._tool_calls(calls)})
+                tools_sent = sent = True
+            yield _with_usage(_chunk(model, {}, "tool_calls"), usage)
             return
         if not sent and not tools_sent:
             raise KiroAuthError("Kiro closed a successful stream without an event")
-        yield _chunk(model, {}, "stop")
+        yield _with_usage(_chunk(model, {}, "stop"), usage)
 
     def _complete(self, model: str, body: dict) -> _AwaitableResponse:
         text: list[str] = []
         tool_calls: list[SimpleNamespace] = []
         finish = "stop"
+        reported = None
         for chunk in self._stream(model, body):
             delta = chunk.choices[0].delta
             if content := getattr(delta, "content", None):
                 text.append(content)
             tool_calls.extend(getattr(delta, "tool_calls", None) or [])
+            reported = getattr(chunk, "usage", None) or reported
             finish = chunk.choices[0].finish_reason or finish
         message = SimpleNamespace(role="assistant", content="".join(text) or None, tool_calls=tool_calls or None, reasoning=None, reasoning_content=None, reasoning_details=None)
         usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0, prompt_tokens_details=SimpleNamespace(cached_tokens=0))
-        return _AwaitableResponse(model=model, choices=[SimpleNamespace(index=0, message=message, finish_reason=finish)], usage=usage)
+        return _AwaitableResponse(model=model, choices=[SimpleNamespace(index=0, message=message, finish_reason=finish)], usage=reported or usage)
