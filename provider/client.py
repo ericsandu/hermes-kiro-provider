@@ -609,14 +609,17 @@ class KiroClient:
 
     def _complete(self, model: str, body: dict) -> _AwaitableResponse:
         text: list[str] = []
+        reasoning: list[str] = []
         tool_calls: list[SimpleNamespace] = []
         finish = "stop"
         for chunk in self._stream(model, body):
             delta = chunk.choices[0].delta
             if content := getattr(delta, "content", None):
                 text.append(content)
+            if thought := getattr(delta, "reasoning_content", None):
+                reasoning.append(thought)
             tool_calls.extend(getattr(delta, "tool_calls", None) or [])
             finish = chunk.choices[0].finish_reason or finish
-        message = SimpleNamespace(role="assistant", content="".join(text) or None, tool_calls=tool_calls or None, reasoning=None, reasoning_content=None, reasoning_details=None)
+        message = SimpleNamespace(role="assistant", content="".join(text) or None, tool_calls=tool_calls or None, reasoning="".join(reasoning) or None, reasoning_content="".join(reasoning) or None, reasoning_details=None)
         usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0, prompt_tokens_details=SimpleNamespace(cached_tokens=0))
         return _AwaitableResponse(model=model, choices=[SimpleNamespace(index=0, message=message, finish_reason=finish)], usage=usage)
