@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Kiro `reasoningContentEvent` text streams to Hermes as `reasoning_content` chunks, so the stream shows activity while the model thinks.
+
+### Changed
+
+- The event stream is read with `read1` when the response provides it, so frames are decoded as they arrive instead of after 8 KB.
+
 ## [1.2.0] - 2026-11-17
 
 ### Added
