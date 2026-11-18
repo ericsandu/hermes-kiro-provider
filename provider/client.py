@@ -5,6 +5,8 @@ import asyncio
 import collections.abc
 import json
 import logging
+import os
+import re
 import time
 from datetime import datetime, timezone
 import urllib.parse
@@ -114,8 +116,45 @@ def _rejects_additional_model_request_fields(exc: KiroHTTPError) -> bool:
     )
 
 
+_IDE_VERSION_DEFAULT = "1.4.215"
+_IDE_VERSION_URL = "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json"
+_IDE_VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+_IDE_VERSION_TTL = 86400
+_IDE_VERSION_FAILURE_TTL = 600
+_IDE_VERSION_TIMEOUT = 3.0
+# (expiry as time.time(), version); an expiry of 0 means nothing is cached.
+_ide_version_cache: tuple[float, str] = (0.0, "")
+
+
+def _ide_version() -> str:
+    """Kiro rejects clients older than its current release (403 FEATURE_NOT_SUPPORTED), so track it.
+
+    Order: KIRO_IDE_VERSION env, the public release metadata (cached 24h, a failed
+    fetch 10 min), then the pinned default. Never raises.
+    """
+    global _ide_version_cache
+    override = os.environ.get("KIRO_IDE_VERSION", "").strip()
+    if _IDE_VERSION_PATTERN.fullmatch(override):
+        return override
+    now = time.time()
+    if _ide_version_cache[1] and now < _ide_version_cache[0]:
+        return _ide_version_cache[1]
+    version, ttl = _IDE_VERSION_DEFAULT, _IDE_VERSION_FAILURE_TTL
+    try:
+        data = request_json(
+            "GET", _IDE_VERSION_URL, headers={"Accept": "application/json"}, timeout=_IDE_VERSION_TIMEOUT,
+        )
+        found = str(data.get("currentRelease") or "")
+        if _IDE_VERSION_PATTERN.fullmatch(found):
+            version, ttl = found, _IDE_VERSION_TTL
+    except Exception:
+        pass
+    _ide_version_cache = (now + ttl, version)
+    return version
+
+
 def _headers(creds, *, accept: str = "application/json", target: str = "") -> dict[str, str]:
-    ua = "aws-sdk-python/1.0 KiroIDE-hermes"
+    ua = f"aws-sdk-python/1.0 KiroIDE-{_ide_version()}-hermes"
     headers = {
         "Accept": accept,
         "Authorization": f"Bearer {creds.access_token}",
