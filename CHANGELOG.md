@@ -7,10 +7,17 @@ All notable changes to this project are documented here.
 ### Added
 
 - Kiro `reasoningContentEvent` text streams to Hermes as `reasoning_content` chunks, so the stream shows activity while the model thinks.
+- The non-streaming path returns the same reasoning text as `reasoning_content` and `reasoning` on the response message.
+- Token usage is reported to Hermes from Kiro's `contextUsagePercentage` and the model's input window: `total_tokens` is the context size after the call, and the prompt/completion split is estimated from output characters. Models missing from the built-in window table report zeros.
 
 ### Changed
 
 - The event stream is read with `read1` when the response provides it, so frames are decoded as they arrive instead of after 8 KB.
+- A tool-use stream is read to its end so the context usage event that follows the stop marker is seen.
+
+### Fixed
+
+- Requests send the current Kiro IDE version in the user agent (`KIRO_IDE_VERSION`, then Kiro's release metadata, then a pinned default). Kiro answers an unversioned agent with `403 FEATURE_NOT_SUPPORTED` on `ListAvailableModels`, which left the model list on the 3-model fallback.
 
 ## [1.2.0] - 2026-11-17
 
